@@ -1,0 +1,5 @@
+server_schemas:
+  databaseserver1hostname:
+    - Schemas
+  databaseserver2hostname:
+    - Schemas
