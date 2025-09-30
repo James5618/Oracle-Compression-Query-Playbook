@@ -1,0 +1,113 @@
+---
+- name: Oracle Compressed Tables Report
+  hosts: dbservers
+  gather_facts: no
+  vars_files:
+    - schemas.yml
+  vars:
+    oracle_sid: "{{ sid | default('orcl') }}"
+    oracle_homes:
+      - "/u01/app/oracle/product/19.0.0/dbhome_1"
+      - "/u01/app/oracle/product/19/dbhome_1"
+    oracle_user: oracle
+    email_from: ""
+    email_to: ""
+    email_subject: "Oracle Compressed Tables Report"
+
+  tasks:
+
+    - name: Select schemas for this host
+      set_fact:
+        schemas: "{{ server_schemas[inventory_hostname] | default([]) }}"
+
+    - name: Check possible ORACLE_HOME paths
+      become: yes
+      become_user: "{{ oracle_user }}"
+      stat:
+        path: "{{ item }}"
+      loop: "{{ oracle_homes }}"
+      register: oracle_home_check
+
+    - name: Set the first existing ORACLE_HOME (from stat results)
+      set_fact:
+        oracle_home: "{{ (oracle_home_check.results | map(attribute='stat') | selectattr('exists') | map(attribute='path') | list | first) | default('') }}"
+
+    - name: Fail if no ORACLE_HOME found
+      fail:
+        msg: "No valid ORACLE_HOME found on host {{ inventory_hostname }}"
+      when: oracle_home is not defined or oracle_home == ''
+
+    - name: Check compressed tables in each schema
+      become: yes
+      become_user: "{{ oracle_user }}"
+      environment:
+        ORACLE_SID: "{{ oracle_sid }}"
+        ORACLE_HOME: "{{ oracle_home }}"
+        PATH: "{{ oracle_home }}/bin:/usr/bin:/bin"
+      shell: |
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<'SQL'
+        SET PAGESIZE 500
+        SET LINESIZE 200
+        SET FEEDBACK OFF
+        SELECT table_name, compression, compress_for
+        FROM dba_tables
+        WHERE owner='{{ item | upper }}' AND compression='ENABLED';
+        EXIT;
+        SQL
+      loop: "{{ schemas }}"
+      loop_control:
+        label: "{{ item }}"
+      register: compressed_tables
+
+    - name: Build HTML table
+      set_fact:
+        html_content: |
+          <html>
+          <body>
+          <h2>Oracle Compressed Tables Report (SID: {{ oracle_sid }})</h2>
+          <table border="1" cellpadding="5" cellspacing="0">
+            <tr>
+              <th>Schema</th>
+              <th>Table Name</th>
+              <th>Compression</th>
+              <th>Compress For</th>
+            </tr>
+            {% for result in compressed_tables.results %}
+              {% set lines = result.stdout_lines | select("match","\\S") | list %}
+              {% if lines | length > 0 %}
+                {% for line in lines %}
+                  {% set cols = line.split() %}
+                  {% if cols | length >= 2 %}
+                    <tr>
+                      <td>{{ result.item }}</td>
+                      <td>{{ cols[0] }}</td>
+                      <td>{{ cols[1] }}</td>
+                      <td>{{ cols[2] if cols|length > 2 else "" }}</td>
+                    </tr>
+                  {% endif %}
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td>{{ result.item }}</td>
+                  <td colspan="3">No compressed tables</td>
+                </tr>
+              {% endif %}
+            {% endfor %}
+          </table>
+          </body>
+          </html>
+
+    - name: Send HTML report via sendmail from controller
+      delegate_to: localhost
+      run_once: false
+      shell: |
+        /usr/sbin/sendmail -t <<'EOF'
+        From: {{ email_from }}
+        To: {{ email_to }}
+        Subject: {{ email_subject }} (host: {{ inventory_hostname }})
+        MIME-Version: 1.0
+        Content-Type: text/html; charset=UTF-8
+        Content-Transfer-Encoding: 8bit
+
+        {{ html_content }}
+        EOF
